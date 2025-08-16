@@ -33,23 +33,6 @@ inline uint8_t rs2(uint32_t inst) { return (inst >> 20) & 0x1F; }
 inline uint8_t funct3(uint32_t inst) { return (inst >> 12) & 0x07; }
 inline uint8_t funct7(uint32_t inst) { return (inst >> 25) & 0x7F; }
 inline Opcode  opcode(uint32_t inst) { return static_cast<Opcode>(inst & 0x7F); }
-
-// https://github.com/NJU-ProjectN/nemu/blob/e13af789353868b40f7cede54fb26f182272ed14/include/macro.h#L86-L88
-#define BITMASK(bits) ((1ull << (bits)) - 1)
-#define BITS(hi, lo) (((inst) >> (lo)) & BITMASK((hi) - (lo) + 1)) // similar to x[hi:lo] in verilog
-#define SEXT(x, len) ({ struct { int64_t n : len; } __x = { .n = x }; (uint64_t)__x.n; })
-//? how to verify the correctness of static_cast<int64_t>BITS(hi, lo) ?
-#define EXTRACT(hi, lo, shift) (SEXT(static_cast<int64_t>BITS(hi, lo), (hi - lo + 1)) << shift)
-
-template<typename T> inline constexpr T immI(uint32_t inst) { return EXTRACT(31, 20,  0); }
-template<typename T> inline constexpr T immU(uint32_t inst) { return EXTRACT(31, 12, 12); }
-template<typename T> inline constexpr T immS(uint32_t inst) { return EXTRACT(31, 25, 5) | EXTRACT(11, 7, 0); }
-template<typename T> inline constexpr T immB(uint32_t inst) {
-    return EXTRACT(31, 31, 12) | EXTRACT( 7,  7, 11) | EXTRACT(30, 25,  5) | EXTRACT(11,  8, 1);
-}
-template<typename T> inline constexpr T immJ(uint32_t inst) {
-    return EXTRACT(31, 31, 20) | EXTRACT(19, 12, 12) | EXTRACT(21, 21, 11) | EXTRACT(30, 21, 1);
-}
 }
 
 template <typename T> class CPU;
@@ -73,7 +56,10 @@ public:
             case 1: return mem[addr - PROGRAM_BASE];
             case 2: return *reinterpret_cast<const uint16_t *>(&mem[addr - PROGRAM_BASE]);
             case 4: return *reinterpret_cast<const uint32_t *>(&mem[addr - PROGRAM_BASE]);
-            case 8: return *reinterpret_cast<const uint64_t *>(&mem[addr - PROGRAM_BASE]);
+            case 8:
+                if constexpr (sizeof(T) == 8) {
+                    return *reinterpret_cast<const uint64_t *>(&mem[addr - PROGRAM_BASE]);
+                }
             default:
                 throw std::invalid_argument("Invalid read length");
         }
@@ -89,7 +75,10 @@ public:
             case 1: mem[addr - PROGRAM_BASE] = value & 0xFF; break;
             case 2: *reinterpret_cast<uint16_t *>(&mem[addr - PROGRAM_BASE]) = value & 0xFFFF; break;
             case 4: *reinterpret_cast<uint32_t *>(&mem[addr - PROGRAM_BASE]) = value & 0xFFFF'FFFF; break;
-            case 8: *reinterpret_cast<uint64_t *>(&mem[addr - PROGRAM_BASE]) = value; break;
+            case 8:
+                if constexpr (sizeof(T) == 8) {
+                    *reinterpret_cast<uint64_t *>(&mem[addr - PROGRAM_BASE]) = value; break;
+                }
             default:
                 throw std::invalid_argument("Invalid write length");
         }
@@ -172,16 +161,17 @@ public:
     }
 
     void run() {
-        while (true) {
+        while (pc != 0) {
             uint32_t inst = memory.read(pc, 4);
             auto instruction = Decoder<T>::Decode(inst);
-            printf("PC: 0x%llx, Instruction: 0x%08x\n", (unsigned long long)pc, inst);
+            printf("PC: 0x%llx, INST: 0x%08x, RA: 0x%llx, SP: 0x%llx\n",
+                   (unsigned long long)pc, inst, (unsigned long long)regs[1], (unsigned long long)regs[2]);
             if (!instruction) {
-                fprintf(stderr, "Unknown instruction at PC: 0x%llx\n", (unsigned long long)(pc - 4));
+                fprintf(stderr, "Unknown instruction at PC: 0x%llx\n", (unsigned long long)pc);
                 break;
             }
 
-            pc = instruction->execute(*this);
+            pc = instruction->Execute(*this);
             regs[0] = 0;
         }
     }
@@ -198,7 +188,11 @@ public:
     Instruction(uint32_t inst) : instruction(inst), opcode(riscv::opcode(inst)) {}
     virtual ~Instruction() = default;
 
-    virtual T execute(CPU<T> &cpu) = 0;
+    virtual T Execute(CPU<T> &cpu) = 0;
+
+    T Extract(uint8_t hi, uint8_t lo, uint8_t shift) {
+        return (instruction >> lo & ((1 << (hi - lo + 1)) - 1)) << shift;
+    }
 
 protected:
     Opcode opcode;
@@ -206,9 +200,9 @@ protected:
 };
 
 template <typename T>
-class RTypeInstruction : public Instruction<T> {
+class RType : public Instruction<T> {
 public:
-    RTypeInstruction(uint32_t inst) : Instruction<T>(inst) {
+    RType(uint32_t inst) : Instruction<T>(inst) {
         rd      = riscv::rd(inst);
         rs1     = riscv::rs1(inst);
         rs2     = riscv::rs2(inst);
@@ -216,16 +210,19 @@ public:
         funct7  = riscv::funct7(inst);
     }
 
-    T execute(CPU<T> &cpu) override {
+    T Execute(CPU<T> &cpu) override {
         switch (funct3) {
             case 0b000: // ADD or SUB
-                cpu.regs[rd] = cpu.regs[rs1] + (funct7 ? -cpu.regs[rs2] : cpu.regs[rs2]);
+                if (funct7 == 0b0100000) { // SUB
+                    cpu.regs[rd] = cpu.regs[rs1] - cpu.regs[rs2];
+                } else { // ADD
+                    cpu.regs[rd] = cpu.regs[rs1] + cpu.regs[rs2];
+                }
                 break;
             case 0b001: // SLL
                 if constexpr (std::is_same_v<T, uint32_t>) {
                     cpu.regs[rd] = cpu.regs[rs1] << (cpu.regs[rs2] & 0x1F);
-                }
-                else {
+                } else {
                     cpu.regs[rd] = cpu.regs[rs1] << (cpu.regs[rs2] & 0x3F);
                 }
                 break;
@@ -271,19 +268,28 @@ private:
 };
 
 template <typename T>
-class ITypeInstruction : public Instruction<T> {
+class IType : public Instruction<T> {
 public:
-    ITypeInstruction(uint32_t inst) : Instruction<T>(inst) {
+    IType(uint32_t inst) : Instruction<T>(inst) {
         rd      = riscv::rd(inst);
         rs1     = riscv::rs1(inst);
-        imm     = riscv::immI<T>(inst);
+        imm     = Immediate();
         funct3  = riscv::funct3(inst);
     }
 
-    T execute(CPU<T> &cpu) override {
+    T Immediate() {
+        T t = this->instruction >> 20;
+        constexpr size_t width = sizeof(T) * 8;
+        auto shift = width - 12;
+        return static_cast<std::make_signed_t<T>>(t << shift) >> shift;
+    }
+
+    T Execute(CPU<T> &cpu) override {
         if (this->opcode == Opcode::JALR) {
-            cpu.regs[rd] = cpu.pc + 4;
-            return (cpu.regs[rs1] + imm) & ~1;
+            T t = cpu.pc + 4;
+            T pc = (cpu.regs[rs1] + imm) & ~1;
+            cpu.regs[rd] = t;
+            return pc;
         } else if (this->opcode == Opcode::LOAD) {
             switch (funct3) {
                 case 0b000: // LB
@@ -310,18 +316,33 @@ public:
                 case 0b000: // ADDI
                     cpu.regs[rd] = cpu.regs[rs1] + imm;
                     break;
-                case 0b010: // SLLI
+                case 0b001: // SLLI
                     if constexpr (std::is_same_v<T, uint32_t>) {
                         cpu.regs[rd] = cpu.regs[rs1] << (imm & 0x1F);
                     } else {
                         cpu.regs[rd] = cpu.regs[rs1] << (imm & 0x3F);
                     }
                     break;
-                case 0b011: // SLLIU
-                    cpu.regs[rd] = cpu.regs[rs1] < imm;
+                case 0b010: // SLTI
+                    cpu.regs[rd] = static_cast<typename std::make_signed_t<T>>(cpu.regs[rs1]) < imm;
+                    break;
+                case 0b011: // SLTIU
+                    cpu.regs[rd] = cpu.regs[rs1] < static_cast<T>(imm);
                     break;
                 case 0b100: // XORI
                     cpu.regs[rd] = cpu.regs[rs1] ^ imm;
+                    break;
+                case 0b101: // SRLI or SRAI
+                    uint8_t tag   = imm >> 0x1F;
+                    uint8_t shamt = imm & 0x1F;
+                    if constexpr (std::is_same_v<T, uint32_t>) {
+                        if ((shamt & 0x20) != 0)
+                            return 0;
+                    }
+                    if (tag == 0)
+                        cpu.regs[rd] = cpu.regs[rs1] >> shamt;
+                    else
+                        cpu.regs[rd] = static_cast<typename std::make_signed_t<T>>(cpu.regs[rs1]) >> shamt;
                     break;
                 case 0b110: // ORI
                     cpu.regs[rd] = cpu.regs[rs1] | imm;
@@ -342,16 +363,23 @@ private:
 };
 
 template <typename T>
-class STypeInstruction : public Instruction<T> {
+class SType : public Instruction<T> {
 public:
-    STypeInstruction(uint32_t inst) : Instruction<T>(inst) {
+    SType(uint32_t inst) : Instruction<T>(inst) {
         rs1    = riscv::rs1(inst);
         rs2    = riscv::rs2(inst);
-        imm    = riscv::immS<T>(inst);
+        imm    = Immediate();
         funct3 = riscv::funct3(inst);
     }
 
-    T execute(CPU<T> &cpu) override {
+    T Immediate() {
+        T t = this->Extract(31, 25, 5) | this->Extract(11, 7, 0);
+        constexpr size_t width = sizeof(T) * 8;
+        auto shift = width - 12;
+        return static_cast<std::make_signed_t<T>>(t << shift) >> shift;
+    }
+
+    T Execute(CPU<T> &cpu) override {
         if (this->opcode == Opcode::STORE) {
             switch (funct3) {
                 case 0b000: // SB
@@ -379,16 +407,23 @@ private:
 };
 
 template <typename T>
-class BTypeInstruction : public Instruction<T> {
+class BType : public Instruction<T> {
 public:
-    BTypeInstruction(uint32_t inst) : Instruction<T>(inst) {
+    BType(uint32_t inst) : Instruction<T>(inst) {
         rs1     = riscv::rs1(inst);
         rs2     = riscv::rs2(inst);
-        imm     = riscv::immB<T>(inst);
+        imm     = Immediate();
         funct3  = riscv::funct3(inst);
     }
 
-    T execute(CPU<T> &cpu) override {
+    T Immediate() {
+        T t = this->Extract(31, 31, 12) | this->Extract( 7,  7, 11) | this->Extract(30, 25,  5) | this->Extract(11,  8, 1);
+        constexpr size_t width = sizeof(T) * 8;
+        auto shift = width - 13;
+        return static_cast<std::make_signed_t<T>>(t << shift) >> shift;
+    }
+
+    T Execute(CPU<T> &cpu) override {
         switch (funct3) {
             case 0b000: // BEQ
                 if (cpu.regs[rs1] == cpu.regs[rs2]) {
@@ -401,7 +436,7 @@ public:
                 }
                 break;
             case 0b100: // BLT
-                if (cpu.regs[rs1] < cpu.regs[rs2]) {
+                if (static_cast<typename std::make_signed_t<T>>(cpu.regs[rs1]) < static_cast<typename std::make_signed_t<T>>(cpu.regs[rs2])) {
                     return cpu.pc + imm;
                 }
                 break;
@@ -433,14 +468,18 @@ private:
 };
 
 template <typename T>
-class UTypeInstruction : public Instruction<T> {
+class UType : public Instruction<T> {
 public:
-    UTypeInstruction(uint32_t inst) : Instruction<T>(inst) {
+    UType(uint32_t inst) : Instruction<T>(inst) {
         rd  = riscv::rd(inst);
-        imm = riscv::immU<T>(inst);
+        imm = Immediate();
     }
 
-    T execute(CPU<T> &cpu) override {
+    T Immediate() {
+        return static_cast<std::make_signed_t<T>>(static_cast<int32_t>(this->instruction & 0xFFFFF000));
+    }
+
+    T Execute(CPU<T> &cpu) override {
         if (this->opcode == Opcode::LUI) {
             cpu.regs[rd] = imm;
         } else if (this->opcode == Opcode::AUIPC) {
@@ -457,19 +496,27 @@ private:
 };
 
 template <typename T>
-class JTypeInstruction : public Instruction<T> {
+class JType : public Instruction<T> {
 public:
-    JTypeInstruction(uint32_t inst) : Instruction<T>(inst) {
+    JType(uint32_t inst) : Instruction<T>(inst) {
         rd = riscv::rd(inst);
-        imm = riscv::immJ<T>(inst);
+        imm = Immediate();
     }
 
-    T execute(CPU<T> &cpu) override {
+    T Immediate() {
+        T t =  this->Extract(31, 31, 20) | this->Extract(19, 12, 12) | this->Extract(20, 20, 11) | this->Extract(30, 21, 1);
+        constexpr size_t width = sizeof(T) * 8;
+        auto shift = width - 21;
+        return static_cast<std::make_signed_t<T>>(t << shift) >> shift;
+    }
+
+    T Execute(CPU<T> &cpu) override {
         if (this->opcode == Opcode::JAL) {
             cpu.regs[rd] = cpu.pc + 4;
-            return cpu.pc + imm;
+            return (cpu.pc + imm);
         } else {
             printf("Unknown opcode 0x%08x in instruction 0x%08x\n", static_cast<uint8_t>(this->opcode), this->instruction);
+            return 0;
         }
         return cpu.pc + 4;
     }
@@ -486,21 +533,23 @@ public:
         switch (riscv::opcode(inst)) {
             case Opcode::LUI:
             case Opcode::AUIPC:
-                return std::make_unique<UTypeInstruction<T>>(inst);
+                return std::make_unique<UType<T>>(inst);
             case Opcode::LOAD:
             case Opcode::JALR:
             case Opcode::IMM:
-                return std::make_unique<ITypeInstruction<T>>(inst);
+                return std::make_unique<IType<T>>(inst);
             case Opcode::JAL:
-                return std::make_unique<JTypeInstruction<T>>(inst);
+                return std::make_unique<JType<T>>(inst);
             case Opcode::BRANCH:
-                return std::make_unique<BTypeInstruction<T>>(inst);
+                return std::make_unique<BType<T>>(inst);
             case Opcode::STORE:
-                return std::make_unique<STypeInstruction<T>>(inst);
+                return std::make_unique<SType<T>>(inst);
             case Opcode::OP:
-                return std::make_unique<RTypeInstruction<T>>(inst);
+                return std::make_unique<RType<T>>(inst);
+            case Opcode::SYSTEM:
+                fprintf(stderr, "System instruction 0x%08x not implemented\n", inst);
             default: {
-                printf("Unknown Opcode 0x%08x\n", static_cast<uint8_t>(riscv::opcode(inst)));
+                fprintf(stderr,"Unknown Opcode 0x%08x\n", static_cast<uint8_t>(riscv::opcode(inst)));
                 return nullptr;
             }
         }
